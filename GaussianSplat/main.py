@@ -1,99 +1,118 @@
 import json
 import numpy as np
-from PIL import Image
+import os
+
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+import cv2
 import open3d as o3d
 
-def load_frames(export_dir):
-    with open(f"{export_dir}/frames.json") as f:
-        return json.load(f)["frames"]
 
-def quaternion_to_matrix(q):
-    x, y, z, w = q
-    return np.array([
-        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
-        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
-        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)]
-    ])
+def load_depth_exr(path):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
 
-def backproject(depth, color, fov_deg, width, height, position, rotation):
-    fx = fy = (width / 2) / np.tan(np.radians(fov_deg / 2))
+    if img is None:
+        raise FileNotFoundError(path)
 
-    intrinsics = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, width/2, height/2)
+    if img.ndim == 3:
+        depth = img[..., 0]
+    else:
+        depth = img
 
-    color_o3d = o3d.geometry.Image((color * 255).astype(np.uint8))
-    depth_o3d = o3d.geometry.Image(depth[:,:,0].astype(np.float32))
+    return depth.astype(np.float32)
 
-    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        color_o3d, depth_o3d,
-        depth_scale=1.0,
-        depth_trunc=1.0,
-        convert_rgb_to_intensity=False
-    )
 
-    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsics)
+def load_color(path):
+    img = cv2.imread(path)
 
-    pos = np.array(position)
-    rot = quaternion_to_matrix(rotation)
+    if img is None:
+        raise FileNotFoundError(path)
 
-    T = np.eye(4)
-    T[:3, :3] = rot
-    T[:3, 3] = pos
-    pcd.transform(T)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    return np.asarray(pcd.points), np.asarray(pcd.colors)
+    return img.astype(np.float32) / 255.0
+
+
+def backproject(depth, color, fov_deg, cam_to_world, near_clip, far_clip):
+    h, w = depth.shape
+
+    # Mask out missing hits (far plane) and behind near clip
+    mask = (depth > near_clip) & (depth < far_clip * 0.9999)
+
+    fy = (h * 0.5) / np.tan(np.radians(fov_deg) * 0.5)
+    fx = fy
+
+    cx = w * 0.5
+    cy = h * 0.5
+
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+
+    # Pixel center offset to match Unity's (x + 0.5) convention
+    uc = u[mask] + 0.5
+    vc = v[mask] + 0.5
+
+    # X right, Y up (flip v), Z forward to match Unity camera space
+    x = (uc - cx) / fx
+    y = -(vc - cy) / fy
+    z = np.ones_like(x)
+
+    dirs = np.stack([x, y, z], axis=-1)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+
+    d = depth[mask]
+
+    pts_cam = np.concatenate([
+        dirs * d[:, None],
+        np.ones((len(d), 1))
+    ], axis=1)
+
+    pts_world = (cam_to_world @ pts_cam.T).T[:, :3]
+
+    return pts_world, color[mask]
+
 
 def main():
     export_dir = "./data/simple_scene"
-    frames = load_frames(export_dir)
 
-    geometries = []
-    all_points = []
-    all_colors = []
+    with open(f"{export_dir}/frames.json") as f:
+        frames = json.load(f)["frames"]
+
+    geoms = [
+        o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+    ]
 
     for frame in frames:
-        pos = np.array(frame["position"])
-        rot = quaternion_to_matrix(frame["rotation"])
-        forward = rot @ np.array([0, 0, 1])
+        depth = load_depth_exr(f"{export_dir}/{frame['depthPath']}")
+        color = load_color(f"{export_dir}/{frame['colorPath']}")
 
-        # camera sphere
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
-        sphere.translate(pos)
-        sphere.paint_uniform_color([1, 0, 0])
-        geometries.append(sphere)
+        c2w = np.array(frame["cameraToWorld"], dtype=np.float64).reshape(4, 4)
 
-        # forward direction line
-        points = [pos, pos + forward * 0.5]
-        lines = [[0, 1]]
-        line_set = o3d.geometry.LineSet()
-        line_set.points = o3d.utility.Vector3dVector(points)
-        line_set.lines = o3d.utility.Vector2iVector(lines)
-        line_set.paint_uniform_color([0, 1, 0])
-        geometries.append(line_set)
+        near_clip = frame["nearClip"]
+        far_clip  = frame["farClip"]
 
-        # backproject
-        color = np.array(Image.open(f"{export_dir}/{frame['colorPath']}")) / 255.0
-        depth = np.array(Image.open(f"{export_dir}/{frame['depthPath']}")) / 255.0
-
-        points_3d, colors_3d = backproject(
-            depth, color,
-            frame["fov"], frame["width"], frame["height"],
-            frame["position"], frame["rotation"]
+        valid = depth[(depth > near_clip) & (depth < far_clip * 0.9999)]
+        print(
+            f"Frame {frame['index']}: "
+            f"{valid.min():.3f}m .. {valid.max():.3f}m  "
+            f"({len(valid)} valid pixels)"
         )
-        all_points.append(points_3d)
-        all_colors.append(colors_3d)
 
-    points = np.concatenate(all_points, axis=0)
-    colors = np.concatenate(all_colors, axis=0)
+        pts, cols = backproject(
+            depth, color, frame["fov"], c2w, near_clip, far_clip
+        )
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    geometries.append(pcd)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+        geoms.append(pcd)
 
-    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-    geometries.append(axis)
+        marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        marker.translate(np.array(frame["position"]))
+        marker.paint_uniform_color([1, 0, 0])
+        geoms.append(marker)
 
-    o3d.visualization.draw_geometries(geometries)
+    o3d.visualization.draw_geometries(geoms)
+
 
 if __name__ == "__main__":
     main()
